@@ -1,0 +1,24 @@
+# Set default behavior to automatically normalize line endings to LF in repository
+* text=auto eol=lf
+
+# Source and configuration files
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf
+*.env text eol=lf
+Makefile text eol=lf
+LICENSE text eol=lf
+
+# Windows shell scripts
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary files
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.pdb binary
