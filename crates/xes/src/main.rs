@@ -77,6 +77,32 @@ struct Cli {
     /// Positional arguments: [SHELL-FORMAT] [FILE...] or [FILE...].
     #[arg(value_name = "ARGS")]
     args: Vec<String>,
+
+    /// Read NUL-delimited KEY=VALUE records (the output of --format null)
+    /// from FILE (or stdin) instead of evaluating a template.
+    #[arg(long = "from-null", num_args = 0..=1, value_name = "FILE")]
+    from_null: Option<Option<PathBuf>>,
+
+    /// Replace the current process with CMD (after `--`), adding the
+    /// resulting variables to its environment. Nothing is printed.
+    #[arg(long = "exec")]
+    exec: bool,
+
+    /// Allowlist glob for names otherwise refused in receiver mode (repeatable).
+    #[arg(long = "accept", value_name = "GLOB")]
+    accept: Vec<String>,
+
+    /// Disable the default unsafe-name denylist in receiver mode.
+    #[arg(long = "allow-unsafe-names")]
+    allow_unsafe_names: bool,
+
+    /// Maximum accepted input size for --from-null, in bytes.
+    #[arg(long = "max-input", default_value_t = xesubst::nullrec::DEFAULT_MAX_INPUT)]
+    max_input: usize,
+
+    /// Command to execute after `--` (used with --exec).
+    #[arg(last = true, value_name = "CMD")]
+    cmd: Vec<String>,
 }
 
 fn main() {
@@ -106,6 +132,16 @@ fn run(cli: Cli) -> Result<(), XesubstError> {
             println!("{v}");
         }
         return Ok(());
+    }
+
+    if cli.exec {
+        return run_exec(cli);
+    }
+
+    if cli.from_null.is_some() {
+        return Err(XesubstError::Usage(
+            "--from-null requires --exec".to_string(),
+        ));
     }
 
     // Initialize environment from process env
@@ -325,4 +361,203 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<(), XesubstError> {
     })?;
 
     Ok(())
+}
+
+/// Receiver / exec mode: `--from-null --exec -- CMD` or `-d --exec -- CMD`.
+fn run_exec(cli: Cli) -> Result<(), XesubstError> {
+    if cli.cmd.is_empty() {
+        return Err(XesubstError::Usage(
+            "--exec requires a command after `--`".to_string(),
+        ));
+    }
+
+    let pairs: Vec<(String, String)> = if let Some(ref source) = cli.from_null {
+        // Receiver mode: the input is untrusted transport data.
+        if cli.dotenv
+            || cli.arith
+            || cli.in_place
+            || cli.variables
+            || cli.keys
+            || cli.output.is_some()
+            || !cli.env_file.is_empty()
+            || !cli.args.is_empty()
+        {
+            return Err(XesubstError::Usage(
+                "--from-null cannot be combined with template evaluation options \
+                 (-d, SHELL-FORMAT, -i, --arith, --keys, --output, --env-file)"
+                    .to_string(),
+            ));
+        }
+
+        let mut input = Vec::new();
+        match source {
+            Some(path) => {
+                File::open(path)
+                    .map_err(|e| {
+                        eprintln!("xes: cannot read '{}': {e}", path.display());
+                        XesubstError::Io(e)
+                    })?
+                    .read_to_end(&mut input)
+                    .map_err(XesubstError::Io)?;
+            }
+            None => {
+                io::stdin()
+                    .lock()
+                    .read_to_end(&mut input)
+                    .map_err(XesubstError::Io)?;
+            }
+        }
+
+        xesubst::nullrec::parse_null_records(&input, cli.max_input)?
+    } else {
+        // Dotenv mode: expansion happened locally, so the denylist is off
+        // unless --accept narrows it explicitly.
+        if !cli.dotenv {
+            return Err(XesubstError::Usage(
+                "--exec requires --dotenv or --from-null".to_string(),
+            ));
+        }
+        if cli.in_place || cli.output.is_some() || cli.keys {
+            return Err(XesubstError::Usage(
+                "--exec cannot be combined with --in-place, --output, or --keys".to_string(),
+            ));
+        }
+
+        let mut env = EnvMap::from_process_env();
+        let mut config = ModeConfig {
+            compat: cli.compat,
+            shell_format_vars: None,
+            nounset: cli.nounset,
+            strict: cli.strict,
+            arith: cli.arith,
+            filename: "<stdin>".to_string(),
+        };
+
+        for env_path in &cli.env_file {
+            let content = std::fs::read_to_string(env_path).map_err(|e| {
+                eprintln!("xes: cannot read env-file '{}': {e}", env_path.display());
+                XesubstError::Io(e)
+            })?;
+            let sub_config = ModeConfig {
+                filename: env_path.display().to_string(),
+                ..config.clone()
+            };
+            eval_dotenv(&content, &mut env, &sub_config, &DotenvOptions::default())?;
+        }
+
+        let (shell_format, input_files) = partition_args(&cli.args);
+        if let Some(format_str) = shell_format {
+            config.shell_format_vars = Some(extract_shell_format_variables(&format_str));
+        }
+
+        let files_to_process = if input_files.is_empty() {
+            vec!["-".to_string()]
+        } else {
+            input_files
+        };
+
+        let mut assigned_order: Vec<String> = Vec::new();
+        let mut assigned_map: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for file_arg in &files_to_process {
+            let is_stdin = file_arg == "-";
+            config.filename = if is_stdin {
+                "<stdin>".to_string()
+            } else {
+                file_arg.clone()
+            };
+            let content = if is_stdin {
+                let mut buf = String::new();
+                io::stdin()
+                    .lock()
+                    .read_to_string(&mut buf)
+                    .map_err(XesubstError::Io)?;
+                buf
+            } else {
+                std::fs::read_to_string(file_arg).map_err(|e| {
+                    eprintln!("xes: cannot read '{file_arg}': {e}");
+                    XesubstError::Io(e)
+                })?
+            };
+
+            let results = match eval_dotenv(&content, &mut env, &config, &DotenvOptions::default())
+            {
+                Ok(r) => r,
+                Err(err) => {
+                    handle_diagnostic(&config.filename, &content, &err);
+                    return Err(err);
+                }
+            };
+            for (k, v) in results {
+                if !assigned_map.contains_key(&k) {
+                    assigned_order.push(k.clone());
+                }
+                assigned_map.insert(k, v);
+            }
+        }
+        assigned_order
+            .into_iter()
+            .map(|k| {
+                let v = assigned_map.get(&k).unwrap().clone();
+                (k, v)
+            })
+            .collect()
+    };
+
+    // Receiver mode always applies the denylist; dotenv mode disables it
+    // unless --accept narrows the accepted names explicitly.
+    let policy = if cli.from_null.is_some() {
+        xesubst::nullrec::NamePolicy::new(&cli.accept, cli.allow_unsafe_names)
+    } else {
+        xesubst::nullrec::NamePolicy::new(&cli.accept, cli.accept.is_empty())
+    };
+    xesubst::nullrec::check_name_policy(&pairs, &policy)?;
+
+    let filtered: Vec<(String, String)> = pairs
+        .into_iter()
+        .filter(|(k, _)| cli.only.is_empty() || cli.only.contains(k))
+        .collect();
+
+    // Names already validated upstream; policy re-check is cheap and keeps
+    // this final gate independent of the source branch.
+    exec_replace(&cli.cmd, &filtered, cli.no_override)
+}
+
+/// Replaces the current process with CMD, adding `pairs` to its environment.
+/// Exit codes follow env(1): 126 if CMD cannot be invoked, 127 if not found.
+#[cfg(unix)]
+fn exec_replace(
+    cmd: &[String],
+    pairs: &[(String, String)],
+    no_override: bool,
+) -> Result<(), XesubstError> {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = process::Command::new(&cmd[0]);
+    command.args(&cmd[1..]);
+    for (key, value) in pairs {
+        if no_override && std::env::var_os(key).is_some() {
+            continue;
+        }
+        command.env(key, value);
+    }
+
+    let err = command.exec();
+    let code = match err.kind() {
+        std::io::ErrorKind::NotFound => 127,
+        _ => 126,
+    };
+    eprintln!("xes: cannot execute '{}': {err}", cmd[0]);
+    process::exit(code);
+}
+
+#[cfg(not(unix))]
+fn exec_replace(
+    _cmd: &[String],
+    _pairs: &[(String, String)],
+    _no_override: bool,
+) -> Result<(), XesubstError> {
+    Err(XesubstError::Usage(
+        "--exec is only supported on Unix platforms".to_string(),
+    ))
 }
