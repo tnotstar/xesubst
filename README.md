@@ -263,6 +263,13 @@ Two transports are available:
   is added automatically when stdin is a TTY). Sender options:
   `--ssh-option OPT` (repeatable, passed to ssh as `-o OPT`) and
   `--remote-xes PATH` (default `xes`).
+- **Connection multiplexing** (`ControlMaster=auto`): when `--ssh` rides an
+  existing master connection, the `-R` forward can outlive the `xes` ssh
+  client and persist until the master closes. This is harmless in practice:
+  the receiver unlinks the remote socket path immediately after connecting,
+  so the stale forward is unreachable by name, the local server accepts
+  exactly one connection, and the random path (128 bits) is unguessable
+  beforehand.
 
 **Threat model.** The design protects secret values from: process argument
 lists (`ps`, `/proc/<pid>/cmdline`), shell history, logs, and persistent
@@ -270,7 +277,9 @@ files on both ends (the socket files exist only for the duration of the
 session and carry no secrets in their names). It does **not** protect
 against the remote root user or the same user on the remote host: they can
 read the target process's environment (`/proc/<pid>/environ`) at any time.
-Treat the remote host as trusted for the secrets you send.
+Treat the remote host as trusted for the secrets you send. The **CMD words
+after `--` are visible in `ps` on both hosts** — never put a secret in the
+command arguments themselves.
 
 **Fail-closed semantics.** The receiver never runs the command on partial
 input: an empty payload, a truncated final record, duplicate keys, invalid

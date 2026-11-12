@@ -4,8 +4,17 @@
 
 use xesubst::dotenv::safe_quote_shell;
 
-/// Number of random bytes used for socket path names (256 bits).
-const RANDOM_BYTES: usize = 32;
+/// Random bytes used for socket and directory names (128 bits).
+const RANDOM_BYTES: usize = 16;
+
+/// Maximum usable Unix socket path length. Linux allows 108 bytes and
+/// macOS 104; 104 is the safe portability bound.
+pub const MAX_SOCKET_PATH: usize = 104;
+
+/// Suffixes appended to the private directory name.
+const DIR_PREFIX: &str = ".xes-";
+const SOCK_NAME: &str = "env.sock";
+const REMOTE_TEMPLATE: &str = "/tmp/xes-";
 
 /// Reads `RANDOM_BYTES` bytes from the operating system CSPRNG
 /// (`/dev/urandom`) and returns them as a lowercase hex string.
@@ -14,6 +23,35 @@ pub fn random_hex() -> std::io::Result<String> {
     let mut buf = [0u8; RANDOM_BYTES];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Builds the local private directory name under `root` and checks that
+/// both the local socket path and the remote socket path fit within
+/// `MAX_SOCKET_PATH` bytes. Returns the directory name (not the full
+/// path) plus the remote socket path.
+pub fn socket_names(root: &std::path::Path, rand_hex: &str) -> Result<(String, String), String> {
+    let dir_name = format!("{DIR_PREFIX}{rand_hex}");
+    let local_len = root
+        .as_os_str()
+        .len()
+        + 1 // path separator
+        + dir_name.len()
+        + 1
+        + SOCK_NAME.len();
+    let remote_socket = format!("{REMOTE_TEMPLATE}{rand_hex}");
+    if local_len > MAX_SOCKET_PATH {
+        return Err(format!(
+            "local socket path would be {local_len} bytes (limit {MAX_SOCKET_PATH}); \
+             set XDG_RUNTIME_DIR to a shorter directory"
+        ));
+    }
+    if remote_socket.len() > MAX_SOCKET_PATH {
+        return Err(format!(
+            "remote socket path would be {} bytes (limit {MAX_SOCKET_PATH})",
+            remote_socket.len()
+        ));
+    }
+    Ok((dir_name, remote_socket))
 }
 
 /// Builds the remote command string executed by ssh:
@@ -134,8 +172,46 @@ mod tests {
     fn random_hex_is_long_and_unique() {
         let a = random_hex().unwrap();
         let b = random_hex().unwrap();
-        assert_eq!(a.len(), 64); // 32 bytes -> 64 hex chars (>= 128 bits)
+        assert_eq!(a.len(), 32); // 16 bytes -> 32 hex chars (128 bits)
         assert_ne!(a, b);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn socket_names_fit_short_runtime_dirs() {
+        // XDG_RUNTIME_DIR typical on Linux: /run/user/1000 (13 bytes).
+        let (dir, remote) = socket_names(std::path::Path::new("/run/user/1000"), &"a".repeat(32))
+            .expect("short root must pass");
+        assert_eq!(dir, format!(".xes-{}", "a".repeat(32)));
+        assert_eq!(remote, format!("/tmp/xes-{}", "a".repeat(32)));
+        // Local: 13 + 1 + 37 + 1 + 8 = 60 bytes; remote: 42 bytes.
+        assert!(remote.len() <= MAX_SOCKET_PATH);
+    }
+
+    #[test]
+    fn socket_names_accept_macos_tmpdir_fallback() {
+        // macOS temp fallback is $TMPDIR, e.g.
+        // /var/folders/1q/abcdefgh_tnotstar/T/ (34 bytes here; longer
+        // user hashes still stay under the limit with 128-bit names).
+        let root = std::path::Path::new("/var/folders/1q/abcdefgh_tnotstar/T");
+        assert!(socket_names(root, &"a".repeat(32)).is_ok());
+        // A root long enough to exceed 104 bytes must fail clearly.
+        let long_root = std::path::PathBuf::from(
+            "/var/folders/1q/abcdefgh_tnotstar/T/".to_string() + &"x".repeat(80),
+        );
+        let err = socket_names(&long_root, &"a".repeat(32)).unwrap_err();
+        assert!(err.contains("local socket path"), "{err}");
+        assert!(err.contains("XDG_RUNTIME_DIR"), "{err}");
+    }
+
+    #[test]
+    fn socket_names_reject_overlong_paths() {
+        // Not reachable via random_hex today (names are 32 hex chars), but
+        // the guards must hold if the name length or templates ever grow.
+        // With an overlong name both checks trip; the local one reports
+        // first, so accept either message.
+        let err =
+            socket_names(std::path::Path::new("/tmp"), &"a".repeat(MAX_SOCKET_PATH)).unwrap_err();
+        assert!(err.contains("socket path"), "{err}");
     }
 }

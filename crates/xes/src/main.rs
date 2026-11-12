@@ -691,9 +691,7 @@ fn run_ssh(cli: Cli, dest: String) -> Result<(), XesubstError> {
     use std::io::IsTerminal;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
-    use std::time::{Duration, Instant};
-
-    const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+    use std::time::Duration;
 
     let pairs = eval_dotenv_cli(&cli)?;
     let filtered: Vec<(String, String)> = pairs
@@ -706,20 +704,26 @@ fn run_ssh(cli: Cli, dest: String) -> Result<(), XesubstError> {
         only: None,
         keys_only: false,
     };
-    let payload = format_dotenv_output(&filtered, &options)?;
+    let mut payload = format_dotenv_output(&filtered, &options)?.into_bytes();
+    // The evaluated pairs are no longer needed; keep only the serialized
+    // copy until it has been served.
+    drop(filtered);
 
-    // Private runtime directory with an unpredictable socket name.
+    // Private runtime directory with an unpredictable socket name. Both
+    // socket paths must fit the ~104-byte Unix socket path limit; the
+    // check happens before anything is created or ssh is spawned.
     let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    let private_dir = runtime_dir.join(format!(".xes-{}", ssh::random_hex()?));
+    let (dir_name, remote_socket) =
+        ssh::socket_names(&runtime_dir, &ssh::random_hex()?).map_err(XesubstError::Usage)?;
+    let private_dir = runtime_dir.join(dir_name);
     std::fs::create_dir(&private_dir).map_err(XesubstError::Io)?;
     std::fs::set_permissions(&private_dir, std::fs::Permissions::from_mode(0o700))
         .map_err(XesubstError::Io)?;
     let local_socket = private_dir.join("env.sock");
     let listener = UnixListener::bind(&local_socket).map_err(XesubstError::Io)?;
 
-    let remote_socket = format!("/tmp/xes-{}", ssh::random_hex()?);
     let remote_command = ssh::build_remote_command(&cli.remote_xes, &remote_socket, &cli.cmd);
     let allocate_tty = std::io::stdin().is_terminal();
     let args = ssh::build_ssh_args(
@@ -740,9 +744,11 @@ fn run_ssh(cli: Cli, dest: String) -> Result<(), XesubstError> {
             XesubstError::Io(e)
         })?;
 
-    // Serve exactly one connection, with a timeout.
+    // Serve exactly one connection. There is no deadline: authentication
+    // (password, passphrase, 2FA, host-key prompt) can take arbitrarily
+    // long, so keep accepting while the ssh child is alive and stop as
+    // soon as it exits.
     listener.set_nonblocking(true).map_err(XesubstError::Io)?;
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
     let connection = loop {
         match listener.accept() {
             Ok((conn, _)) => break conn,
@@ -752,13 +758,6 @@ fn run_ssh(cli: Cli, dest: String) -> Result<(), XesubstError> {
                     return Err(XesubstError::Usage(format!(
                         "ssh exited before connecting back (status {status})"
                     )));
-                }
-                if Instant::now() > deadline {
-                    let _ = ssh_child.kill();
-                    cleanup_socket(&local_socket, &private_dir);
-                    return Err(XesubstError::Usage(
-                        "remote did not connect back within the timeout".to_string(),
-                    ));
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -775,13 +774,18 @@ fn run_ssh(cli: Cli, dest: String) -> Result<(), XesubstError> {
     {
         use std::io::Write;
         let mut w = connection;
-        if let Err(e) = w.write_all(payload.as_bytes()).and_then(|_| w.flush()) {
+        if let Err(e) = w.write_all(&payload).and_then(|_| w.flush()) {
             eprintln!("xes: failed to send payload: {e}");
             let _ = ssh_child.kill();
             cleanup_socket(&local_socket, &private_dir);
             return Err(XesubstError::Io(e));
         }
     }
+    // Best-effort scrub of the in-memory copy; the data has been served.
+    for byte in payload.iter_mut() {
+        *byte = 0;
+    }
+    drop(payload);
     drop(listener);
 
     let status = ssh_child.wait().map_err(XesubstError::Io)?;
