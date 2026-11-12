@@ -1,5 +1,7 @@
 //! xes CLI binary.
 
+mod ssh;
+
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -107,6 +109,24 @@ struct Cli {
     /// Command to execute after `--` (used with --exec).
     #[arg(last = true, value_name = "CMD")]
     cmd: Vec<String>,
+
+    /// Connect to a Unix socket and read the NUL-delimited payload from it
+    /// (receiver side of --ssh), then proceed as --from-null.
+    #[arg(long = "from-socket", value_name = "PATH", conflicts_with_all = ["from_null", "dotenv", "in_place"])]
+    from_socket: Option<PathBuf>,
+
+    /// Evaluate the template locally and deliver the variables to CMD on a
+    /// remote host over ssh, via a forwarded Unix socket. Requires -d.
+    #[arg(long = "ssh", value_name = "DEST", requires = "dotenv", conflicts_with_all = ["exec", "from_null", "from_socket", "in_place", "keys", "output"])]
+    ssh_dest: Option<String>,
+
+    /// Extra option passed verbatim to ssh as `-o OPT` (repeatable).
+    #[arg(long = "ssh-option", value_name = "OPT")]
+    ssh_option: Vec<String>,
+
+    /// Path of the xes binary on the remote host (default: `xes`).
+    #[arg(long = "remote-xes", default_value = "xes")]
+    remote_xes: String,
 }
 
 fn main() {
@@ -136,6 +156,13 @@ fn run(cli: Cli) -> Result<(), XesubstError> {
             println!("{v}");
         }
         return Ok(());
+    }
+
+    if let Some(dest) = cli.ssh_dest.clone() {
+        return run_ssh(cli, dest);
+    }
+    if let Some(ref socket_path) = cli.from_socket {
+        return run_from_socket(&cli, socket_path);
     }
 
     if cli.exec || cli.from_null {
@@ -422,37 +449,13 @@ fn run_exec(cli: Cli) -> Result<(), XesubstError> {
             }
         }
 
-        let pairs = xesubst::nullrec::parse_null_records(&input, cli.max_input)?;
-        if pairs.is_empty() && !cli.allow_empty {
-            return Err(XesubstError::NullRecord {
-                index: 0,
-                name: None,
-                message: "no records received (a failed sender must not leave the \
-                          command unconfigured; use --allow-empty to override)"
-                    .to_string(),
-            });
+        match handle_received(&cli, &input)? {
+            Some(pairs) => pairs,
+            None => return Ok(()), // --keys: names printed
         }
-        let policy = xesubst::nullrec::NamePolicy::new(&cli.accept, !cli.allow_unsafe_names);
-        xesubst::nullrec::check_name_policy(&pairs, &policy)?;
-
-        if cli.keys {
-            // Debugging aid: names only, never values.
-            let mut out = io::stdout().lock();
-            for (name, _) in &pairs {
-                writeln!(out, "{name}").map_err(XesubstError::Io)?;
-            }
-            return Ok(());
-        }
-        if !cli.exec {
-            return Err(XesubstError::Usage(
-                "--from-null requires --exec (or --keys to list names)".to_string(),
-            ));
-        }
-
-        pairs
     } else {
         // Dotenv mode: expansion happened locally, so the denylist is off
-        // unless --accept narrows it explicitly.
+        // unless --accept narrows the accepted names explicitly.
         if !cli.dotenv {
             return Err(XesubstError::Usage(
                 "--exec requires --dotenv or --from-null".to_string(),
@@ -464,85 +467,7 @@ fn run_exec(cli: Cli) -> Result<(), XesubstError> {
             ));
         }
 
-        let mut env = EnvMap::from_process_env();
-        let mut config = ModeConfig {
-            compat: cli.compat,
-            shell_format_vars: None,
-            nounset: cli.nounset,
-            strict: cli.strict,
-            arith: cli.arith,
-            filename: "<stdin>".to_string(),
-        };
-
-        for env_path in &cli.env_file {
-            let content = std::fs::read_to_string(env_path).map_err(|e| {
-                eprintln!("xes: cannot read env-file '{}': {e}", env_path.display());
-                XesubstError::Io(e)
-            })?;
-            let sub_config = ModeConfig {
-                filename: env_path.display().to_string(),
-                ..config.clone()
-            };
-            eval_dotenv(&content, &mut env, &sub_config, &DotenvOptions::default())?;
-        }
-
-        let (shell_format, input_files) = partition_args(&cli.args);
-        if let Some(format_str) = shell_format {
-            config.shell_format_vars = Some(extract_shell_format_variables(&format_str));
-        }
-
-        let files_to_process = if input_files.is_empty() {
-            vec!["-".to_string()]
-        } else {
-            input_files
-        };
-
-        let mut assigned_order: Vec<String> = Vec::new();
-        let mut assigned_map: std::collections::BTreeMap<String, String> =
-            std::collections::BTreeMap::new();
-        for file_arg in &files_to_process {
-            let is_stdin = file_arg == "-";
-            config.filename = if is_stdin {
-                "<stdin>".to_string()
-            } else {
-                file_arg.clone()
-            };
-            let content = if is_stdin {
-                let mut buf = String::new();
-                io::stdin()
-                    .lock()
-                    .read_to_string(&mut buf)
-                    .map_err(XesubstError::Io)?;
-                buf
-            } else {
-                std::fs::read_to_string(file_arg).map_err(|e| {
-                    eprintln!("xes: cannot read '{file_arg}': {e}");
-                    XesubstError::Io(e)
-                })?
-            };
-
-            let results = match eval_dotenv(&content, &mut env, &config, &DotenvOptions::default())
-            {
-                Ok(r) => r,
-                Err(err) => {
-                    handle_diagnostic(&config.filename, &content, &err);
-                    return Err(err);
-                }
-            };
-            for (k, v) in results {
-                if !assigned_map.contains_key(&k) {
-                    assigned_order.push(k.clone());
-                }
-                assigned_map.insert(k, v);
-            }
-        }
-        assigned_order
-            .into_iter()
-            .map(|k| {
-                let v = assigned_map.get(&k).unwrap().clone();
-                (k, v)
-            })
-            .collect()
+        eval_dotenv_cli(&cli)?
     };
 
     // Dotenv mode: expansion happened locally, so the denylist is off unless
@@ -565,6 +490,317 @@ fn run_exec(cli: Cli) -> Result<(), XesubstError> {
     // Names already validated upstream; policy re-check is cheap and keeps
     // this final gate independent of the source branch.
     exec_replace(&cli.cmd, &filtered, cli.no_override)
+}
+
+/// Shared receiver post-processing for `--from-null` and `--from-socket`:
+/// fail-closed parsing, name policy, `--keys` output. Returns `None` when
+/// `--keys` has been handled.
+fn handle_received(cli: &Cli, input: &[u8]) -> Result<Option<Vec<(String, String)>>, XesubstError> {
+    let pairs = xesubst::nullrec::parse_null_records(input, cli.max_input)?;
+    if pairs.is_empty() && !cli.allow_empty {
+        return Err(XesubstError::NullRecord {
+            index: 0,
+            name: None,
+            message: "no records received (a failed sender must not leave the \
+                      command unconfigured; use --allow-empty to override)"
+                .to_string(),
+        });
+    }
+    let policy = xesubst::nullrec::NamePolicy::new(&cli.accept, !cli.allow_unsafe_names);
+    xesubst::nullrec::check_name_policy(&pairs, &policy)?;
+
+    if cli.keys {
+        // Debugging aid: names only, never values.
+        let mut out = io::stdout().lock();
+        for (name, _) in &pairs {
+            writeln!(out, "{name}").map_err(XesubstError::Io)?;
+        }
+        return Ok(None);
+    }
+    if !cli.exec {
+        return Err(XesubstError::Usage(
+            "--from-null/--from-socket requires --exec (or --keys to list names)".to_string(),
+        ));
+    }
+
+    Ok(Some(pairs))
+}
+
+/// Evaluates the `-d` template inputs (files or stdin, plus `--env-file`
+/// preloads) locally and returns the resulting pairs.
+fn eval_dotenv_cli(cli: &Cli) -> Result<Vec<(String, String)>, XesubstError> {
+    let mut env = EnvMap::from_process_env();
+    let mut config = ModeConfig {
+        compat: cli.compat,
+        shell_format_vars: None,
+        nounset: cli.nounset,
+        strict: cli.strict,
+        arith: cli.arith,
+        filename: "<stdin>".to_string(),
+    };
+
+    for env_path in &cli.env_file {
+        let content = std::fs::read_to_string(env_path).map_err(|e| {
+            eprintln!("xes: cannot read env-file '{}': {e}", env_path.display());
+            XesubstError::Io(e)
+        })?;
+        let sub_config = ModeConfig {
+            filename: env_path.display().to_string(),
+            ..config.clone()
+        };
+        eval_dotenv(&content, &mut env, &sub_config, &DotenvOptions::default())?;
+    }
+
+    let (shell_format, input_files) = partition_args(&cli.args);
+    if let Some(format_str) = shell_format {
+        config.shell_format_vars = Some(extract_shell_format_variables(&format_str));
+    }
+
+    let files_to_process = if input_files.is_empty() {
+        vec!["-".to_string()]
+    } else {
+        input_files
+    };
+
+    let mut assigned_order: Vec<String> = Vec::new();
+    let mut assigned_map: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for file_arg in &files_to_process {
+        let is_stdin = file_arg == "-";
+        config.filename = if is_stdin {
+            "<stdin>".to_string()
+        } else {
+            file_arg.clone()
+        };
+        let content = if is_stdin {
+            let mut buf = String::new();
+            io::stdin()
+                .lock()
+                .read_to_string(&mut buf)
+                .map_err(XesubstError::Io)?;
+            buf
+        } else {
+            std::fs::read_to_string(file_arg).map_err(|e| {
+                eprintln!("xes: cannot read '{file_arg}': {e}");
+                XesubstError::Io(e)
+            })?
+        };
+
+        let results = match eval_dotenv(&content, &mut env, &config, &DotenvOptions::default()) {
+            Ok(r) => r,
+            Err(err) => {
+                handle_diagnostic(&config.filename, &content, &err);
+                return Err(err);
+            }
+        };
+        for (k, v) in results {
+            if !assigned_map.contains_key(&k) {
+                assigned_order.push(k.clone());
+            }
+            assigned_map.insert(k, v);
+        }
+    }
+    Ok(assigned_order
+        .into_iter()
+        .map(|k| {
+            let v = assigned_map.get(&k).unwrap().clone();
+            (k, v)
+        })
+        .collect())
+}
+
+/// Receiver side of `--ssh`: read the payload from a Unix socket, unlink it,
+/// then proceed exactly as `--from-null`. Fail closed: an empty, truncated,
+/// or early-closed payload never reaches the command.
+#[cfg(unix)]
+fn run_from_socket(cli: &Cli, socket_path: &Path) -> Result<(), XesubstError> {
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    if cli.exec && cli.cmd.is_empty() {
+        return Err(XesubstError::Usage(
+            "--exec requires a command after `--`".to_string(),
+        ));
+    }
+    if cli.keys && cli.exec {
+        return Err(XesubstError::Usage(
+            "--keys cannot be combined with --exec".to_string(),
+        ));
+    }
+    if !cli.exec && !cli.keys {
+        return Err(XesubstError::Usage(
+            "--from-socket requires --exec (or --keys to list names)".to_string(),
+        ));
+    }
+
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+        eprintln!("xes: cannot connect to '{}': {e}", socket_path.display());
+        XesubstError::Io(e)
+    })?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(XesubstError::Io)?;
+
+    // Read bounded by --max-input; a hostile sender cannot grow memory.
+    let mut input = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = stream.read(&mut chunk).map_err(XesubstError::Io)?;
+        if n == 0 {
+            break;
+        }
+        input.extend_from_slice(&chunk[..n]);
+        if input.len() > cli.max_input {
+            return Err(XesubstError::NullRecord {
+                index: 0,
+                name: None,
+                message: format!(
+                    "payload exceeds the {} byte limit (see --max-input)",
+                    cli.max_input
+                ),
+            });
+        }
+    }
+
+    // The socket served its purpose; remove it regardless of what follows.
+    let _ = std::fs::remove_file(socket_path);
+
+    if let Some(pairs) = handle_received(cli, &input)? {
+        let filtered: Vec<(String, String)> = pairs
+            .into_iter()
+            .filter(|(k, _)| cli.only.is_empty() || cli.only.contains(k))
+            .collect();
+        exec_replace(&cli.cmd, &filtered, cli.no_override)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn run_from_socket(_cli: &Cli, _socket_path: &Path) -> Result<(), XesubstError> {
+    Err(XesubstError::Usage(
+        "--from-socket is only supported on Unix platforms".to_string(),
+    ))
+}
+
+/// Sender side: evaluate the template locally, expose the serialized pairs
+/// on a one-shot local Unix socket, forward it over ssh, and propagate the
+/// ssh exit status.
+#[cfg(unix)]
+fn run_ssh(cli: Cli, dest: String) -> Result<(), XesubstError> {
+    use std::io::IsTerminal;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+
+    let pairs = eval_dotenv_cli(&cli)?;
+    let filtered: Vec<(String, String)> = pairs
+        .into_iter()
+        .filter(|(k, _)| cli.only.is_empty() || cli.only.contains(k))
+        .collect();
+    let options = DotenvOptions {
+        no_override: cli.no_override,
+        format: DotenvFormat::Null,
+        only: None,
+        keys_only: false,
+    };
+    let payload = format_dotenv_output(&filtered, &options)?;
+
+    // Private runtime directory with an unpredictable socket name.
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let private_dir = runtime_dir.join(format!(".xes-{}", ssh::random_hex()?));
+    std::fs::create_dir(&private_dir).map_err(XesubstError::Io)?;
+    std::fs::set_permissions(&private_dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(XesubstError::Io)?;
+    let local_socket = private_dir.join("env.sock");
+    let listener = UnixListener::bind(&local_socket).map_err(XesubstError::Io)?;
+
+    let remote_socket = format!("/tmp/xes-{}", ssh::random_hex()?);
+    let remote_command = ssh::build_remote_command(&cli.remote_xes, &remote_socket, &cli.cmd);
+    let allocate_tty = std::io::stdin().is_terminal();
+    let args = ssh::build_ssh_args(
+        &dest,
+        &remote_socket,
+        &local_socket.to_string_lossy(),
+        allocate_tty,
+        &cli.ssh_option,
+        &remote_command,
+    );
+
+    let mut ssh_child = process::Command::new("ssh")
+        .args(&args)
+        .spawn()
+        .map_err(|e| {
+            eprintln!("xes: cannot execute ssh: {e}");
+            cleanup_socket(&local_socket, &private_dir);
+            XesubstError::Io(e)
+        })?;
+
+    // Serve exactly one connection, with a timeout.
+    listener.set_nonblocking(true).map_err(XesubstError::Io)?;
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    let connection = loop {
+        match listener.accept() {
+            Ok((conn, _)) => break conn,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if let Some(status) = ssh_child.try_wait().map_err(XesubstError::Io)? {
+                    cleanup_socket(&local_socket, &private_dir);
+                    return Err(XesubstError::Usage(format!(
+                        "ssh exited before connecting back (status {status})"
+                    )));
+                }
+                if Instant::now() > deadline {
+                    let _ = ssh_child.kill();
+                    cleanup_socket(&local_socket, &private_dir);
+                    return Err(XesubstError::Usage(
+                        "remote did not connect back within the timeout".to_string(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => {
+                cleanup_socket(&local_socket, &private_dir);
+                return Err(XesubstError::Io(e));
+            }
+        }
+    };
+
+    connection
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .map_err(XesubstError::Io)?;
+    {
+        use std::io::Write;
+        let mut w = connection;
+        if let Err(e) = w.write_all(payload.as_bytes()).and_then(|_| w.flush()) {
+            eprintln!("xes: failed to send payload: {e}");
+            let _ = ssh_child.kill();
+            cleanup_socket(&local_socket, &private_dir);
+            return Err(XesubstError::Io(e));
+        }
+    }
+    drop(listener);
+
+    let status = ssh_child.wait().map_err(XesubstError::Io)?;
+    cleanup_socket(&local_socket, &private_dir);
+    process::exit(status.code().unwrap_or(1));
+}
+
+#[cfg(not(unix))]
+fn run_ssh(_cli: Cli, _dest: String) -> Result<(), XesubstError> {
+    Err(XesubstError::Usage(
+        "--ssh is only supported on Unix platforms".to_string(),
+    ))
+}
+
+/// Removes the one-shot socket and its private directory.
+#[cfg(unix)]
+fn cleanup_socket(local_socket: &Path, private_dir: &Path) {
+    let _ = std::fs::remove_file(local_socket);
+    let _ = std::fs::remove_dir(private_dir);
 }
 
 /// Replaces the current process with CMD, adding `pairs` to its environment.
