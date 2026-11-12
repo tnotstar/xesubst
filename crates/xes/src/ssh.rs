@@ -55,16 +55,33 @@ pub fn socket_names(root: &std::path::Path, rand_hex: &str) -> Result<(String, S
 }
 
 /// Builds the remote command string executed by ssh:
-/// `<remote-xes> --from-socket SOCK --exec -- CMD...`, with every CMD
-/// argument quoted for the remote shell. When `cmd` is empty the remote
-/// login shell (`$SHELL`, expanded by the remote shell) is used.
-pub fn build_remote_command(remote_xes: &str, socket: &str, cmd: &[String]) -> String {
+/// `<remote-xes> --from-socket SOCK --exec [--accept GLOB]...
+/// [--allow-unsafe-names] -- CMD...`, with every CMD argument quoted for
+/// the remote shell. The local name policy flags are forwarded so the
+/// receiver enforces the same set. When `cmd` is empty the remote login
+/// shell (`"$SHELL" -l`, expanded by the remote shell) is used.
+pub fn build_remote_command(
+    remote_xes: &str,
+    socket: &str,
+    accept: &[String],
+    allow_unsafe_names: bool,
+    cmd: &[String],
+) -> String {
     let mut out = format!(
-        "{quoted} --from-socket {socket} --exec --",
+        "{quoted} --from-socket {socket} --exec",
         quoted = safe_quote_shell(remote_xes)
     );
+    for glob in accept {
+        out.push_str(" --accept ");
+        out.push_str(&safe_quote_shell(glob));
+    }
+    if allow_unsafe_names {
+        out.push_str(" --allow-unsafe-names");
+    }
+    out.push_str(" --");
     if cmd.is_empty() {
-        out.push_str(" $SHELL");
+        // Real login shell: expanded and double-quoted by the remote shell.
+        out.push_str(" \"$SHELL\" -l");
     } else {
         for arg in cmd {
             out.push(' ');
@@ -98,6 +115,7 @@ pub fn build_ssh_args(
         args.push("-o".into());
         args.push(opt.clone());
     }
+    args.push("--".into());
     args.push(dest.to_string());
     args.push(remote_command.to_string());
     args
@@ -115,7 +133,7 @@ mod tests {
             "it's".to_string(),
             "$HOME".to_string(),
         ];
-        let out = build_remote_command("xes", "/tmp/s", &cmd);
+        let out = build_remote_command("xes", "/tmp/s", &[], false, &cmd);
         assert_eq!(
             out,
             "'xes' --from-socket /tmp/s --exec -- 'program' 'arg with spaces' 'it'\\''s' '$HOME'",
@@ -127,15 +145,40 @@ mod tests {
     #[test]
     fn remote_command_defaults_to_login_shell() {
         assert_eq!(
-            build_remote_command("xes", "/tmp/s", &[]),
-            "'xes' --from-socket /tmp/s --exec -- $SHELL"
+            build_remote_command("xes", "/tmp/s", &[], false, &[]),
+            "'xes' --from-socket /tmp/s --exec -- \"$SHELL\" -l"
         );
+    }
+
+    #[test]
+    fn remote_command_forwards_name_policy_flags() {
+        let out = build_remote_command(
+            "xes",
+            "/tmp/s",
+            &["LD_*".to_string(), "MY_[A-Z]*".to_string()],
+            true,
+            &["c".into()],
+        );
+        assert!(
+            out.starts_with(
+                "'xes' --from-socket /tmp/s --exec \
+                            --accept 'LD_*' --accept 'MY_[A-Z]*' --allow-unsafe-names -- "
+            ),
+            "{out}"
+        );
+        // Globs are quoted; no glob character is interpreted remotely.
+        assert!(out.contains("'MY_[A-Z]*'"), "{out}");
+        // Without --allow-unsafe-names the flag must not appear.
+        let strict = build_remote_command("xes", "/s", &["X*".to_string()], false, &["c".into()]);
+        assert!(strict.contains("--accept 'X*'"), "{strict}");
+        assert!(!strict.contains("--allow-unsafe-names"), "{strict}");
     }
 
     #[test]
     fn remote_xes_path_is_quoted() {
         assert!(
-            build_remote_command("/opt/bin/xes", "/s", &["c".into()]).starts_with("'/opt/bin/xes'")
+            build_remote_command("/opt/bin/xes", "/s", &[], false, &["c".into()])
+                .starts_with("'/opt/bin/xes'")
         );
     }
 
@@ -156,9 +199,10 @@ mod tests {
         assert_eq!(args[4], "-t");
         assert_eq!(args[5], "-o");
         assert_eq!(args[6], "ServerAliveInterval=30");
-        assert_eq!(args[7], "user@host");
-        assert_eq!(args[8], "remote-cmd");
-        assert_eq!(args.len(), 9);
+        assert_eq!(args[7], "--");
+        assert_eq!(args[8], "user@host");
+        assert_eq!(args[9], "remote-cmd");
+        assert_eq!(args.len(), 10);
     }
 
     #[test]

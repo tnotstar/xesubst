@@ -52,7 +52,8 @@ fn serve_once(sock: &std::path::Path, payload: &[u8]) {
 fn socket_payload_reaches_child_environment() {
     let sock = tmp_socket("happy");
     let value = "multi\nline $notexpanded 'quoted'";
-    let payload = format!("GOOD={value}\0OTHER=x y\0");
+    // Socket protocol: records + end-of-payload marker (extra NUL).
+    let payload = format!("GOOD={value}\0OTHER=x y\0\0");
 
     // Start the sender first: the receiver connects, then we serve.
     let listener = UnixListener::bind(&sock).unwrap();
@@ -78,8 +79,50 @@ fn socket_payload_reaches_child_environment() {
 }
 
 #[test]
+fn socket_large_payload_round_trip() {
+    // Well above the 8 KiB read chunk: exercises the bounded read loop and
+    // blocking write path. 8 x 32 KiB values (Linux caps a single argument
+    // at 128 KiB, so one huge variable cannot be passed via exec anyway).
+    let sock = tmp_socket("large");
+    let mut payload = Vec::new();
+    let mut expected = Vec::new();
+    for i in 0..8 {
+        let value = format!("{i}-").repeat(16 * 1024); // 32 KiB
+        payload.extend_from_slice(format!("BIG_{i}={value}\0").as_bytes());
+        expected.push(format!("BIG_{i}={value}"));
+    }
+    payload.push(0); // end-of-payload marker
+    assert!(payload.len() > 256 * 1024);
+
+    let listener = UnixListener::bind(&sock).unwrap();
+    let child = spawn_receiver(&sock, &[], &["/usr/bin/env", "-0"]);
+    let (mut conn, _) = listener.accept().unwrap();
+    conn.write_all(&payload).unwrap();
+    conn.flush().unwrap();
+    drop(conn);
+
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    for pair in &expected {
+        assert!(text.contains(pair.as_str()), "missing {}", &pair[..16]);
+    }
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn socket_fail_closed_on_empty_and_truncated_payloads() {
-    for (name, payload) in [("empty", ""), ("truncated", "A=1\0B=2")] {
+    // "boundary" is cut exactly between two records: complete records, but
+    // no end-of-payload marker — must be rejected as truncated.
+    for (name, payload) in [
+        ("empty", ""),
+        ("truncated", "A=1\0B=2"),
+        ("boundary", "A=1\0B=2\0"),
+    ] {
         let sock = tmp_socket(name);
         serve_once(&sock, payload.as_bytes());
         let child = spawn_receiver(&sock, &[], &["/bin/sh", "-c", "echo RAN"]);
@@ -87,6 +130,11 @@ fn socket_fail_closed_on_empty_and_truncated_payloads() {
         assert_eq!(
             out.status.code(),
             Some(2),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("truncated"),
             "{name}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
@@ -102,7 +150,7 @@ fn socket_fail_closed_on_empty_and_truncated_payloads() {
 #[test]
 fn socket_empty_payload_allowed_with_allow_empty() {
     let sock = tmp_socket("allow-empty");
-    serve_once(&sock, b"");
+    serve_once(&sock, b"\0"); // bare end-of-payload marker = empty payload
     let child = Command::new(XES)
         .arg("--from-socket")
         .arg(&sock)
@@ -124,7 +172,7 @@ fn socket_empty_payload_allowed_with_allow_empty() {
 #[test]
 fn socket_name_policy_applies() {
     let sock = tmp_socket("deny");
-    serve_once(&sock, b"LD_PRELOAD=\0PATH=/evil\0GOOD=1\0");
+    serve_once(&sock, b"LD_PRELOAD=\0PATH=/evil\0GOOD=1\0\0");
     let child = spawn_receiver(&sock, &[], &["/bin/true"]);
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(2));
@@ -137,7 +185,7 @@ fn socket_name_policy_applies() {
 #[test]
 fn socket_keys_prints_names_only() {
     let sock = tmp_socket("keys");
-    serve_once(&sock, b"SECRET_VALUE=hunter2\0");
+    serve_once(&sock, b"SECRET_VALUE=hunter2\0\0");
     let out = Command::new(XES)
         .arg("--from-socket")
         .arg(&sock)

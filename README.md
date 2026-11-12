@@ -270,6 +270,15 @@ Two transports are available:
   so the stale forward is unreachable by name, the local server accepts
   exactly one connection, and the random path (128 bits) is unguessable
   beforehand.
+- The socket payload ends with an explicit end-of-payload marker (an extra
+  NUL) so the receiver detects truncation even on a record boundary.
+  `--remote-xes PATH` is passed to the remote shell **literally** — no `~`
+  or variable expansion happens locally, so use an absolute path when the
+  binary is not on the remote default `PATH`. When no command is given, the
+  receiver runs the remote login shell as `"$SHELL" -l`.
+- The evaluated variable names are checked against the local name policy
+  **before** ssh is spawned, and `--accept` / `--allow-unsafe-names` are
+  forwarded to the receiver so both sides enforce the same set.
 
 **Threat model.** The design protects secret values from: process argument
 lists (`ps`, `/proc/<pid>/cmdline`), shell history, logs, and persistent

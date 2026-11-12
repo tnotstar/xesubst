@@ -172,6 +172,27 @@ pub fn parse_null_records(
     Ok(pairs)
 }
 
+/// Parses a socket-protocol payload: NUL-delimited records terminated by an
+/// explicit end-of-payload marker (one extra NUL after the last record's
+/// own terminator). This detects truncation that happens to fall exactly
+/// on a record boundary. An empty payload is the bare marker (`"\0"`).
+pub fn parse_socket_records(
+    input: &[u8],
+    max_input: usize,
+) -> Result<Vec<(String, String)>, XesubstError> {
+    if input == b"\0" {
+        return Ok(Vec::new());
+    }
+    if !input.ends_with(b"\0\0") {
+        return Err(XesubstError::NullRecord {
+            index: 0,
+            name: None,
+            message: "payload is truncated (missing end-of-payload marker)".to_string(),
+        });
+    }
+    parse_null_records(&input[..input.len() - 1], max_input)
+}
+
 /// Parses one raw record; `index` is its zero-based position for diagnostics.
 fn parse_record(record: &[u8], index: usize) -> Result<(String, String), XesubstError> {
     let eq = match record.iter().position(|&b| b == b'=') {
@@ -363,6 +384,29 @@ mod tests {
         let err = parse_null_records(b"A=1\0B=2", DEFAULT_MAX_INPUT).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("truncated"), "{msg}");
+    }
+
+    #[test]
+    fn socket_payload_requires_end_marker() {
+        // Happy path: marker present.
+        assert_eq!(
+            parse_socket_records(b"A=1\0B=2\0\0", DEFAULT_MAX_INPUT).unwrap(),
+            vec![("A".into(), "1".into()), ("B".into(), "2".into())]
+        );
+        // Empty payload is the bare marker.
+        assert!(
+            parse_socket_records(b"\0", DEFAULT_MAX_INPUT)
+                .unwrap()
+                .is_empty()
+        );
+        // Cut exactly between two records (no marker): rejected.
+        let err = parse_socket_records(b"A=1\0B=2\0", DEFAULT_MAX_INPUT).unwrap_err();
+        assert!(err.to_string().contains("missing end-of-payload marker"));
+        // Completely empty input is also truncated.
+        assert!(parse_socket_records(b"", DEFAULT_MAX_INPUT).is_err());
+        // All other validation still applies.
+        let err = parse_socket_records(b"A=1\0A=2\0\0", DEFAULT_MAX_INPUT).unwrap_err();
+        assert!(err.to_string().contains("duplicate"));
     }
 
     #[test]

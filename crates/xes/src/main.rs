@@ -497,6 +497,15 @@ fn run_exec(cli: Cli) -> Result<(), XesubstError> {
 /// `--keys` has been handled.
 fn handle_received(cli: &Cli, input: &[u8]) -> Result<Option<Vec<(String, String)>>, XesubstError> {
     let pairs = xesubst::nullrec::parse_null_records(input, cli.max_input)?;
+    apply_receiver_rules(cli, &pairs)
+}
+
+/// Empty-payload check, receiver name policy, and `--keys` output shared
+/// by both transports. Returns `None` when `--keys` has been handled.
+fn apply_receiver_rules(
+    cli: &Cli,
+    pairs: &[(String, String)],
+) -> Result<Option<Vec<(String, String)>>, XesubstError> {
     if pairs.is_empty() && !cli.allow_empty {
         return Err(XesubstError::NullRecord {
             index: 0,
@@ -507,12 +516,12 @@ fn handle_received(cli: &Cli, input: &[u8]) -> Result<Option<Vec<(String, String
         });
     }
     let policy = xesubst::nullrec::NamePolicy::new(&cli.accept, !cli.allow_unsafe_names);
-    xesubst::nullrec::check_name_policy(&pairs, &policy)?;
+    xesubst::nullrec::check_name_policy(pairs, &policy)?;
 
     if cli.keys {
         // Debugging aid: names only, never values.
         let mut out = io::stdout().lock();
-        for (name, _) in &pairs {
+        for (name, _) in pairs {
             writeln!(out, "{name}").map_err(XesubstError::Io)?;
         }
         return Ok(None);
@@ -523,7 +532,7 @@ fn handle_received(cli: &Cli, input: &[u8]) -> Result<Option<Vec<(String, String
         ));
     }
 
-    Ok(Some(pairs))
+    Ok(Some(pairs.to_vec()))
 }
 
 /// Evaluates the `-d` template inputs (files or stdin, plus `--env-file`
@@ -666,7 +675,11 @@ fn run_from_socket(cli: &Cli, socket_path: &Path) -> Result<(), XesubstError> {
     // The socket served its purpose; remove it regardless of what follows.
     let _ = std::fs::remove_file(socket_path);
 
-    if let Some(pairs) = handle_received(cli, &input)? {
+    // Socket protocol: the payload must end with the end-of-payload marker
+    // (an extra NUL), so truncation on a record boundary is detected.
+    let pairs = xesubst::nullrec::parse_socket_records(&input, cli.max_input)?;
+
+    if let Some(pairs) = apply_receiver_rules(cli, &pairs)? {
         let filtered: Vec<(String, String)> = pairs
             .into_iter()
             .filter(|(k, _)| cli.only.is_empty() || cli.only.contains(k))
@@ -689,7 +702,7 @@ fn run_from_socket(_cli: &Cli, _socket_path: &Path) -> Result<(), XesubstError> 
 #[cfg(unix)]
 fn run_ssh(cli: Cli, dest: String) -> Result<(), XesubstError> {
     use std::io::IsTerminal;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::net::UnixListener;
     use std::time::Duration;
 
@@ -698,6 +711,15 @@ fn run_ssh(cli: Cli, dest: String) -> Result<(), XesubstError> {
         .into_iter()
         .filter(|(k, _)| cli.only.is_empty() || cli.only.contains(k))
         .collect();
+
+    // Validate the evaluated names against the local name policy before
+    // anything is sent: dotenv expansion is local and trusted, so the
+    // denylist is off unless --accept narrows the set (same rule as
+    // `-d --exec`).
+    let denylist = !cli.accept.is_empty() && !cli.allow_unsafe_names;
+    let policy = xesubst::nullrec::NamePolicy::new(&cli.accept, denylist);
+    xesubst::nullrec::check_name_policy(&filtered, &policy)?;
+
     let options = DotenvOptions {
         no_override: cli.no_override,
         format: DotenvFormat::Null,
@@ -705,6 +727,9 @@ fn run_ssh(cli: Cli, dest: String) -> Result<(), XesubstError> {
         keys_only: false,
     };
     let mut payload = format_dotenv_output(&filtered, &options)?.into_bytes();
+    // End-of-payload marker: one extra NUL, required by --from-socket so
+    // truncation on a record boundary is detected.
+    payload.push(0);
     // The evaluated pairs are no longer needed; keep only the serialized
     // copy until it has been served.
     drop(filtered);
@@ -718,13 +743,21 @@ fn run_ssh(cli: Cli, dest: String) -> Result<(), XesubstError> {
     let (dir_name, remote_socket) =
         ssh::socket_names(&runtime_dir, &ssh::random_hex()?).map_err(XesubstError::Usage)?;
     let private_dir = runtime_dir.join(dir_name);
-    std::fs::create_dir(&private_dir).map_err(XesubstError::Io)?;
-    std::fs::set_permissions(&private_dir, std::fs::Permissions::from_mode(0o700))
+    let mut dir_builder = std::fs::DirBuilder::new();
+    dir_builder
+        .mode(0o700) // atomic 0700 creation, no chmod window
+        .create(&private_dir)
         .map_err(XesubstError::Io)?;
     let local_socket = private_dir.join("env.sock");
     let listener = UnixListener::bind(&local_socket).map_err(XesubstError::Io)?;
 
-    let remote_command = ssh::build_remote_command(&cli.remote_xes, &remote_socket, &cli.cmd);
+    let remote_command = ssh::build_remote_command(
+        &cli.remote_xes,
+        &remote_socket,
+        &cli.accept,
+        cli.allow_unsafe_names,
+        &cli.cmd,
+    );
     let allocate_tty = std::io::stdin().is_terminal();
     let args = ssh::build_ssh_args(
         &dest,
@@ -768,6 +801,11 @@ fn run_ssh(cli: Cli, dest: String) -> Result<(), XesubstError> {
         }
     };
 
+    // On macOS/BSD the accepted socket inherits the listener's
+    // non-blocking flag; restore blocking mode before writing.
+    connection
+        .set_nonblocking(false)
+        .map_err(XesubstError::Io)?;
     connection
         .set_write_timeout(Some(Duration::from_secs(30)))
         .map_err(XesubstError::Io)?;
