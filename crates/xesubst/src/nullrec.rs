@@ -72,34 +72,41 @@ pub fn is_valid_name(name: &str) -> bool {
 }
 
 /// Name policy applied to untrusted `KEY=VALUE` records.
+///
+/// Semantics (fail closed):
+/// - When `denylist` is active, unsafe names are always refused; only the
+///   caller (via `--allow-unsafe-names`, which constructs the policy with
+///   `denylist: false`) can lift it. `accept` never overrides the denylist.
+/// - When `accept` is non-empty it is a restrictive allowlist: a name that
+///   matches no glob is refused, not silently dropped.
 #[derive(Debug, Clone, Default)]
 pub struct NamePolicy {
-    /// Glob patterns (repeatable `--accept`) naming the exceptions that may
-    /// bypass the default denylist. When empty, no exception exists.
+    /// Restrictive allowlist globs (repeatable `--accept`); empty means all
+    /// (otherwise permitted) names pass.
     pub accept: Vec<Pattern>,
-    /// Escape hatch (`--allow-unsafe-names`): disable the denylist entirely.
-    pub allow_unsafe: bool,
+    /// Whether the unsafe-name denylist is active.
+    pub denylist: bool,
 }
 
 impl NamePolicy {
-    /// Builds a policy from raw `--accept` glob strings and the
-    /// `--allow-unsafe-names` flag.
-    pub fn new(accept_globs: &[String], allow_unsafe: bool) -> Self {
+    /// Builds a policy from raw `--accept` glob strings and whether the
+    /// unsafe-name denylist is active (`--allow-unsafe-names` disables it).
+    pub fn new(accept_globs: &[String], denylist: bool) -> Self {
         Self {
             accept: accept_globs
                 .iter()
                 .map(|g| parse_pattern_from_str(g))
                 .collect(),
-            allow_unsafe,
+            denylist,
         }
     }
 
     /// Returns true if `name` is permitted under this policy.
     pub fn permits(&self, name: &str) -> bool {
-        if self.allow_unsafe {
-            return true;
+        if self.denylist && is_unsafe_name(name) {
+            return false;
         }
-        if !is_unsafe_name(name) {
+        if self.accept.is_empty() {
             return true;
         }
         let chars: Vec<char> = name.chars().collect();
@@ -108,9 +115,11 @@ impl NamePolicy {
 }
 
 /// Parses NUL-delimited `KEY=VALUE` records (the exact output of
-/// `--format null`). A single trailing NUL is accepted; values are raw bytes
-/// carried through verbatim. Diagnostics mention only the record index and
-/// the variable name, never a value.
+/// `--format null`). Every record, including the last, must be terminated
+/// by NUL; a final unterminated record is rejected as truncated. Duplicate
+/// keys are rejected. Values are raw bytes carried through verbatim.
+/// Diagnostics mention only the record index and the variable name, never
+/// a value.
 pub fn parse_null_records(
     input: &[u8],
     max_input: usize,
@@ -132,21 +141,32 @@ pub fn parse_null_records(
         return Ok(pairs);
     }
 
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut start = 0usize;
     let mut index = 0usize;
     for pos in 0..input.len() {
         if input[pos] != 0 {
             continue;
         }
-        // Skip the empty tail produced by a trailing NUL.
-        if !(pos == start && pos == input.len() - 1) {
-            pairs.push(parse_record(&input[start..pos], index)?);
-            index += 1;
+        let record = parse_record(&input[start..pos], index)?;
+        if !seen.insert(record.0.clone()) {
+            let name = record.0;
+            return Err(XesubstError::NullRecord {
+                index,
+                name: Some(name.clone()),
+                message: format!("duplicate variable name '{name}'"),
+            });
         }
+        pairs.push(record);
+        index += 1;
         start = pos + 1;
     }
     if start < input.len() {
-        pairs.push(parse_record(&input[start..], index)?);
+        return Err(XesubstError::NullRecord {
+            index,
+            name: None,
+            message: "final record is truncated (missing NUL terminator)".to_string(),
+        });
     }
 
     Ok(pairs)
@@ -239,9 +259,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_input_is_ok() {
+    fn empty_input_is_ok_but_bare_nul_is_a_bad_record() {
         assert!(parse(b"").is_empty());
-        assert!(parse(b"\0").is_empty()); // single trailing NUL
+        // A lone NUL is an empty (missing '=') record, not valid input.
+        assert!(parse_null_records(b"\0", DEFAULT_MAX_INPUT).is_err());
     }
 
     #[test]
@@ -312,16 +333,44 @@ mod tests {
     }
 
     #[test]
-    fn policy_accept_glob_and_escape_hatch() {
-        let pairs = vec![("LD_LIBRARY_PATH".to_string(), String::new())];
+    fn policy_accept_is_restrictive_and_never_lifts_denylist() {
+        let denied = vec![("LD_LIBRARY_PATH".to_string(), String::new())];
+        let allowed = vec![("DATABASE_URL".to_string(), String::new())];
 
-        let strict = NamePolicy::default();
-        assert!(check_name_policy(&pairs, &strict).is_err());
+        // Receiver default: denylist active, no allowlist.
+        let strict = NamePolicy::new(&[], true);
+        assert!(check_name_policy(&denied, &strict).is_err());
+        assert!(check_name_policy(&allowed, &strict).is_ok());
 
-        let accept = NamePolicy::new(&["LD_LIBRARY_*".to_string()], false);
-        assert!(check_name_policy(&pairs, &accept).is_ok());
+        // --accept alone never lifts the denylist...
+        let accept = NamePolicy::new(&["LD_LIBRARY_*".to_string()], true);
+        assert!(check_name_policy(&denied, &accept).is_err());
+        // ...but it restricts: a safe name matching no glob is refused.
+        assert!(check_name_policy(&allowed, &accept).is_err());
+        let narrow = NamePolicy::new(&["DATABASE_*".to_string()], true);
+        assert!(check_name_policy(&allowed, &narrow).is_ok());
 
-        let hatch = NamePolicy::new(&[], true);
-        assert!(check_name_policy(&pairs, &hatch).is_ok());
+        // --allow-unsafe-names lifts the denylist; --accept still narrows.
+        let hatch = NamePolicy::new(&[], false);
+        assert!(check_name_policy(&denied, &hatch).is_ok());
+        let hatch_narrow = NamePolicy::new(&["LD_LIBRARY_*".to_string()], false);
+        assert!(check_name_policy(&denied, &hatch_narrow).is_ok());
+        assert!(check_name_policy(&allowed, &hatch_narrow).is_err());
+    }
+
+    #[test]
+    fn truncated_final_record_is_rejected() {
+        let err = parse_null_records(b"A=1\0B=2", DEFAULT_MAX_INPUT).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("truncated"), "{msg}");
+    }
+
+    #[test]
+    fn duplicate_keys_are_rejected() {
+        let err = parse_null_records(b"A=1\0B=2\0A=3\0", DEFAULT_MAX_INPUT).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate variable name 'A'"), "{msg}");
+        assert!(msg.contains("record 2"), "{msg}");
+        assert!(!msg.contains("=3"), "diagnostic must not contain the value");
     }
 }

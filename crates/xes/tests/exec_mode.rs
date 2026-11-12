@@ -145,7 +145,7 @@ fn no_override_respects_existing_environment() {
 }
 
 #[test]
-fn deny_by_default_accept_by_glob_escape_hatch() {
+fn deny_by_default_accept_restrictive_escape_hatch() {
     let records = null_records(&[("LD_PRELOAD", "/evil"), ("PATH", "/evil")]);
 
     let (code, _, stderr) = run_xes(&["--from-null", "--exec", "--", "env"], &records);
@@ -156,16 +156,32 @@ fn deny_by_default_accept_by_glob_escape_hatch() {
         "diagnostic leaked a value: {stderr}"
     );
 
-    // Accepted names still land in the child environment; an absolute path
-    // keeps PATH overriding from breaking command resolution, and empty
-    // LD_PRELOAD keeps the loader quiet.
-    let out = env0(
-        &null_records(&[("LD_PRELOAD", ""), ("PATH", "/nonexistent")]),
-        &["--accept", "LD_*", "--accept", "PATH"],
+    // --accept never lifts the denylist: LD_* still refused even when it
+    // matches the glob.
+    let (code, _, stderr) = run_xes(
+        &[
+            "--from-null",
+            "--accept",
+            "LD_*",
+            "--allow-unsafe-names",
+            "--exec",
+            "--",
+            "/bin/true",
+        ],
+        &null_records(&[("LD_PRELOAD", "")]),
     );
-    assert!(out.iter().any(|l| l == "LD_PRELOAD="), "{out:?}");
-    assert!(out.iter().any(|l| l == "PATH=/nonexistent"), "{out:?}");
+    assert_eq!(code, 0, "{stderr}");
 
+    // --accept is restrictive: a safe name matching no glob is an error.
+    let (code, _, stderr) = run_xes(
+        &["--from-null", "--accept", "OTHER_*", "--exec", "--", "true"],
+        &null_records(&[("GOOD_NAME", "v")]),
+    );
+    assert_eq!(code, 2);
+    assert!(stderr.contains("GOOD_NAME"), "{stderr}");
+
+    // Lifting the denylist requires --allow-unsafe-names; empty LD_PRELOAD
+    // keeps the loader quiet and an absolute path survives PATH overriding.
     let out = env0(
         &null_records(&[("LD_PRELOAD", ""), ("PATH", "/nonexistent")]),
         &["--allow-unsafe-names"],
@@ -193,6 +209,59 @@ fn dotenv_exec_denies_only_when_accept_given() {
         !stderr.contains("/opt/lib"),
         "diagnostic leaked a value: {stderr}"
     );
+}
+
+#[test]
+fn fail_closed_on_empty_truncated_and_duplicate_payloads() {
+    // Zero records: refused unless --allow-empty; the command must not run.
+    let (code, stdout, stderr) = run_xes(
+        &["--from-null", "--exec", "--", "sh", "-c", "echo RAN"],
+        b"",
+    );
+    assert_eq!(code, 2, "{stderr}");
+    assert_eq!(stdout.trim(), "", "command ran on empty payload");
+
+    let (code, stdout, _) = run_xes(
+        &[
+            "--from-null",
+            "--allow-empty",
+            "--exec",
+            "--",
+            "sh",
+            "-c",
+            "echo RAN",
+        ],
+        b"",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "RAN");
+
+    // Truncated final record (no NUL terminator).
+    let (code, _, stderr) = run_xes(&["--from-null", "--exec", "--", "true"], b"A=1\0B=2");
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("truncated"), "{stderr}");
+
+    // Duplicate keys.
+    let (code, _, stderr) = run_xes(&["--from-null", "--exec", "--", "true"], b"A=1\0B=2\0A=3\0");
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("duplicate variable name 'A'"), "{stderr}");
+    assert!(
+        !stderr.contains("=3"),
+        "diagnostic leaked a value: {stderr}"
+    );
+}
+
+#[test]
+fn from_null_keys_prints_names_only() {
+    let (code, stdout, stderr) = run_xes(
+        &["--from-null", "--keys"],
+        &null_records(&[("SECRET_VALUE", "hunter2"), ("OTHER", "x")]),
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(lines.contains(&"SECRET_VALUE"));
+    assert!(lines.contains(&"OTHER"));
+    assert!(!stdout.contains("hunter2"), "keys output leaked a value");
 }
 
 #[test]
@@ -263,6 +332,8 @@ fn usage_conflicts_rejected() {
         vec!["--from-null", "-d", "--exec", "--", "true"],
         vec!["--from-null", "--arith", "--exec", "--", "true"],
         vec!["--from-null", "-i", "--exec", "--", "true"],
+        vec!["--from-null", "$F", "--exec", "--", "true"],
+        vec!["--from-null", "--keys", "--exec", "--", "true"],
         vec!["--from-null"],
         vec!["--exec", "--"],
         vec!["--exec", "--", "true"],

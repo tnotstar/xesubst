@@ -199,7 +199,31 @@ xes -d --env-file base.env app.env
 xes -d --no-override app.env
 ```
 
-### 5. In-Place File Editing (`-i` / `--in-place`)
+### 5. Delivering Variables to Another Program (`--exec`)
+
+Instead of printing, replace the current process with a command whose
+environment gains the evaluated variables:
+
+```bash
+xes -d --exec -- ./program < .env.dev
+
+# Receiver mode: consume NUL-delimited records produced by --format null.
+# Values are never expanded or interpreted; names that can subvert the
+# target process (LD_*, PATH, IFS, ...) are refused by default.
+xes -d --format null < .env.dev | ssh host 'xes --from-null --exec -- ./program'
+```
+
+Notes for pipelines:
+
+- Use `set -o pipefail` (or check the sender's exit status) in pipelines: the
+  receiver fails closed on an empty, truncated, or malformed payload, so a
+  failed sender cannot leave the target command running unconfigured.
+- With `-d --exec` and the template read from **stdin** (as above), the child
+  process inherits that same stdin, already at EOF. Read the template from a
+  file argument (`xes -d --exec .env.dev -- ./program`) if the child needs
+  stdin.
+
+### 6. In-Place File Editing (`-i` / `--in-place`)
 
 Safely modifies files in place using atomic write + rename semantics:
 

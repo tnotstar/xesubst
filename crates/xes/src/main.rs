@@ -79,14 +79,18 @@ struct Cli {
     args: Vec<String>,
 
     /// Read NUL-delimited KEY=VALUE records (the output of --format null)
-    /// from FILE (or stdin) instead of evaluating a template.
-    #[arg(long = "from-null", num_args = 0..=1, value_name = "FILE")]
-    from_null: Option<Option<PathBuf>>,
+    /// from FILE arguments or stdin instead of evaluating a template.
+    #[arg(long = "from-null")]
+    from_null: bool,
 
     /// Replace the current process with CMD (after `--`), adding the
     /// resulting variables to its environment. Nothing is printed.
     #[arg(long = "exec")]
     exec: bool,
+
+    /// Accept an empty record payload instead of failing closed.
+    #[arg(long = "allow-empty")]
+    allow_empty: bool,
 
     /// Allowlist glob for names otherwise refused in receiver mode (repeatable).
     #[arg(long = "accept", value_name = "GLOB")]
@@ -134,14 +138,8 @@ fn run(cli: Cli) -> Result<(), XesubstError> {
         return Ok(());
     }
 
-    if cli.exec {
+    if cli.exec || cli.from_null {
         return run_exec(cli);
-    }
-
-    if cli.from_null.is_some() {
-        return Err(XesubstError::Usage(
-            "--from-null requires --exec".to_string(),
-        ));
     }
 
     // Initialize environment from process env
@@ -363,52 +361,95 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<(), XesubstError> {
     Ok(())
 }
 
-/// Receiver / exec mode: `--from-null --exec -- CMD` or `-d --exec -- CMD`.
+/// Receiver / exec mode: `--from-null [--exec -- CMD]` or `-d --exec -- CMD`.
 fn run_exec(cli: Cli) -> Result<(), XesubstError> {
-    if cli.cmd.is_empty() {
+    if cli.exec && cli.cmd.is_empty() {
         return Err(XesubstError::Usage(
             "--exec requires a command after `--`".to_string(),
         ));
     }
+    if cli.keys && cli.exec {
+        return Err(XesubstError::Usage(
+            "--keys cannot be combined with --exec".to_string(),
+        ));
+    }
 
-    let pairs: Vec<(String, String)> = if let Some(ref source) = cli.from_null {
+    let pairs: Vec<(String, String)> = if cli.from_null {
         // Receiver mode: the input is untrusted transport data.
         if cli.dotenv
             || cli.arith
             || cli.in_place
             || cli.variables
-            || cli.keys
             || cli.output.is_some()
             || !cli.env_file.is_empty()
-            || !cli.args.is_empty()
         {
             return Err(XesubstError::Usage(
                 "--from-null cannot be combined with template evaluation options \
-                 (-d, SHELL-FORMAT, -i, --arith, --keys, --output, --env-file)"
+                 (-d, -i, --arith, --output, --env-file)"
                     .to_string(),
             ));
         }
 
+        // Positional arguments are FILEs; a SHELL-FORMAT is a conflict.
+        let (shell_format, input_files) = partition_args(&cli.args);
+        if shell_format.is_some() {
+            return Err(XesubstError::Usage(
+                "--from-null cannot be combined with a SHELL-FORMAT".to_string(),
+            ));
+        }
+
         let mut input = Vec::new();
-        match source {
-            Some(path) => {
-                File::open(path)
-                    .map_err(|e| {
-                        eprintln!("xes: cannot read '{}': {e}", path.display());
-                        XesubstError::Io(e)
-                    })?
-                    .read_to_end(&mut input)
-                    .map_err(XesubstError::Io)?;
-            }
-            None => {
-                io::stdin()
-                    .lock()
-                    .read_to_end(&mut input)
-                    .map_err(XesubstError::Io)?;
+        if input_files.is_empty() || (input_files.len() == 1 && input_files[0] == "-") {
+            io::stdin()
+                .lock()
+                .read_to_end(&mut input)
+                .map_err(XesubstError::Io)?;
+        } else {
+            for file_arg in &input_files {
+                if file_arg == "-" {
+                    io::stdin()
+                        .lock()
+                        .read_to_end(&mut input)
+                        .map_err(XesubstError::Io)?;
+                } else {
+                    File::open(file_arg)
+                        .and_then(|mut f| f.read_to_end(&mut input))
+                        .map_err(|e| {
+                            eprintln!("xes: cannot read '{file_arg}': {e}");
+                            XesubstError::Io(e)
+                        })?;
+                }
             }
         }
 
-        xesubst::nullrec::parse_null_records(&input, cli.max_input)?
+        let pairs = xesubst::nullrec::parse_null_records(&input, cli.max_input)?;
+        if pairs.is_empty() && !cli.allow_empty {
+            return Err(XesubstError::NullRecord {
+                index: 0,
+                name: None,
+                message: "no records received (a failed sender must not leave the \
+                          command unconfigured; use --allow-empty to override)"
+                    .to_string(),
+            });
+        }
+        let policy = xesubst::nullrec::NamePolicy::new(&cli.accept, !cli.allow_unsafe_names);
+        xesubst::nullrec::check_name_policy(&pairs, &policy)?;
+
+        if cli.keys {
+            // Debugging aid: names only, never values.
+            let mut out = io::stdout().lock();
+            for (name, _) in &pairs {
+                writeln!(out, "{name}").map_err(XesubstError::Io)?;
+            }
+            return Ok(());
+        }
+        if !cli.exec {
+            return Err(XesubstError::Usage(
+                "--from-null requires --exec (or --keys to list names)".to_string(),
+            ));
+        }
+
+        pairs
     } else {
         // Dotenv mode: expansion happened locally, so the denylist is off
         // unless --accept narrows it explicitly.
@@ -504,13 +545,16 @@ fn run_exec(cli: Cli) -> Result<(), XesubstError> {
             .collect()
     };
 
-    // Receiver mode always applies the denylist; dotenv mode disables it
-    // unless --accept narrows the accepted names explicitly.
-    let policy = if cli.from_null.is_some() {
-        xesubst::nullrec::NamePolicy::new(&cli.accept, cli.allow_unsafe_names)
+    // Dotenv mode: expansion happened locally, so the denylist is off unless
+    // --accept narrows the accepted names explicitly. Receiver mode already
+    // applied its (always-on unless --allow-unsafe-names) policy above; the
+    // re-check below is idempotent.
+    let denylist = if cli.from_null {
+        !cli.allow_unsafe_names
     } else {
-        xesubst::nullrec::NamePolicy::new(&cli.accept, cli.accept.is_empty())
+        !cli.accept.is_empty() && !cli.allow_unsafe_names
     };
+    let policy = xesubst::nullrec::NamePolicy::new(&cli.accept, denylist);
     xesubst::nullrec::check_name_policy(&pairs, &policy)?;
 
     let filtered: Vec<(String, String)> = pairs
