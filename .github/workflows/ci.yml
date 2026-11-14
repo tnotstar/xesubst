@@ -16,7 +16,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # macos-latest is dropped until a macOS maintainer is available;
+        # the exec fixtures are portable, so it can be re-added unchanged.
+        os: [ubuntu-latest]
 
     steps:
       - name: Checkout repository
