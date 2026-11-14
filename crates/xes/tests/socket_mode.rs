@@ -173,7 +173,9 @@ fn socket_empty_payload_allowed_with_allow_empty() {
 fn socket_name_policy_applies() {
     let sock = tmp_socket("deny");
     serve_once(&sock, b"LD_PRELOAD=\0PATH=/evil\0GOOD=1\0\0");
-    let child = spawn_receiver(&sock, &[], &["/bin/true"]);
+    // Never exec'd (the policy refuses first), but keep the path portable:
+    // /bin/true does not exist on macOS.
+    let child = spawn_receiver(&sock, &[], &["/usr/bin/true"]);
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
