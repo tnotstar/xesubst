@@ -33,6 +33,31 @@ pub enum XesubstError {
     /// Usage / configuration error. Exit code 2.
     #[error("Usage error: {0}")]
     Usage(String),
+
+    /// Malformed NUL-delimited record (receiver mode). Exit code 2.
+    /// The message names the record index and variable name only; values are
+    /// never included.
+    #[error("record {index}: {message}")]
+    NullRecord {
+        /// Zero-based position of the offending record.
+        index: usize,
+        /// Variable name when known; never a value.
+        name: Option<String>,
+        /// Human-readable cause, free of values.
+        message: String,
+    },
+
+    /// Variable name refused by the receiver name policy. Exit code 2.
+    #[error(
+        "record {index}: variable name '{name}' is refused by the default policy \
+         (use --accept GLOB or --allow-unsafe-names to override)"
+    )]
+    UnsafeName {
+        /// Zero-based position of the offending record.
+        index: usize,
+        /// The refused variable name.
+        name: String,
+    },
 }
 
 impl XesubstError {
@@ -44,7 +69,7 @@ impl XesubstError {
             | Self::Arithmetic { .. }
             | Self::StrictViolation { .. }
             | Self::CrlfStrict { .. } => 1,
-            Self::Usage(_) => 2,
+            Self::Usage(_) | Self::NullRecord { .. } | Self::UnsafeName { .. } => 2,
             Self::Io(_) => 3,
         }
     }
@@ -57,7 +82,9 @@ impl XesubstError {
             | Self::Arithmetic { span, .. }
             | Self::StrictViolation { span, .. }
             | Self::CrlfStrict { span } => Some(*span),
-            Self::Io(_) | Self::Usage(_) => None,
+            Self::Io(_) | Self::Usage(_) | Self::NullRecord { .. } | Self::UnsafeName { .. } => {
+                None
+            }
         }
     }
 }

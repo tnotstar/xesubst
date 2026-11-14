@@ -71,7 +71,12 @@ make distclean  # Remove all derivative assets (cargo clean)
 | Integer arithmetic `$(( ... ))` | ❌ | ✅ | With `--arith` | ❌ | With `--arith` |
 | Sequential line-by-line `.env` evaluation | ❌ | Via `source` | ❌ | ❌ | ✅ |
 | Multi-format `.env` output (`dotenv`, `export`, `json`, `null`) | ❌ | ❌ | ❌ | ❌ | ✅ |
-| Safe sandboxing (no process execution / RCE) | ✅ | ❌ (evaluates code) | ✅ | ✅ | ✅ |
+| Deliver variables to another program (`--exec`) | ❌ | ❌ | ❌ | ❌ | ✅ |
+| Receive variables over a pipe or SSH (`--from-null`, `--ssh`) | ❌ | ❌ | ❌ | ❌ | ✅ |
+| Safe sandboxing (no process execution / RCE)¹ | ✅ | ❌ (evaluates code) | ✅ | ✅ | ✅ |
+
+¹ `--exec` runs the command you name, after local template evaluation; the
+template language itself never executes code.
 
 ---
 
@@ -186,6 +191,9 @@ xes -d --format json app.env
 # NUL-delimited format (for xargs -0 or env -0):
 xes -d --format null app.env
 
+# Load into the current shell (always quote the command substitution):
+eval "$(xes -d --format export app.env)"
+
 # Output only specific keys:
 xes -d --only DATABASE_URL app.env
 
@@ -199,7 +207,97 @@ xes -d --env-file base.env app.env
 xes -d --no-override app.env
 ```
 
-### 5. In-Place File Editing (`-i` / `--in-place`)
+### 5. Delivering Variables to Another Program (`--exec`)
+
+Instead of printing, replace the current process with a command whose
+environment gains the evaluated variables:
+
+```bash
+xes -d --exec -- ./program < .env.dev
+
+# Receiver mode: consume NUL-delimited records produced by --format null.
+# Values are never expanded or interpreted; names that can subvert the
+# target process (LD_*, PATH, IFS, ...) are refused by default.
+xes -d --format null < .env.dev | ssh host 'xes --from-null --exec -- ./program'
+```
+
+Notes for pipelines:
+
+- Use `set -o pipefail` (or check the sender's exit status) in pipelines: the
+  receiver fails closed on an empty, truncated, or malformed payload, so a
+  failed sender cannot leave the target command running unconfigured.
+- With `-d --exec` and the template read from **stdin** (as above), the child
+  process inherits that same stdin, already at EOF. Read the template from a
+  file argument (`xes -d --exec .env.dev -- ./program`) if the child needs
+  stdin.
+
+### 6. Passing Environment over SSH (`--ssh`)
+
+`--ssh DEST` (combined with `-d`) evaluates the template **locally** and
+delivers the resulting variables to a program on the remote host inside the
+encrypted SSH channel — without `SendEnv`/`AcceptEnv`, and without secrets
+ever appearing in a process argument list, a shell history, a log, or a
+persistent file:
+
+```bash
+# Interactive shell on the remote host with the variables set:
+xes -d .env.dev --ssh user@host
+
+# Run a specific program:
+xes -d .env.dev --ssh user@host -- ./program arg
+```
+
+Two transports are available:
+
+- **Pipe mode** (`--from-null`, receiver): the sender ships the variables as
+  NUL-delimited records over standard input
+  (`xes -d --format null | ssh host 'xes --from-null --exec -- CMD'`).
+  Standard input is consumed by the payload, so the remote command has no
+  usable stdin.
+- **Socket mode** (`--ssh` / `--from-socket`): the sender evaluates the
+  template in memory, serves the payload exactly once on a local Unix socket
+  in a private (0700) runtime directory, and asks ssh to forward a remote
+  socket to it (`ssh -o ExitOnForwardFailure=yes -R …`). The remote receiver
+  (`xes --from-socket PATH --exec -- CMD`) reads the payload, unlinks the
+  socket, and execs the command. This keeps the terminal interactive (`-t`
+  is added automatically when stdin is a TTY). Sender options:
+  `--ssh-option OPT` (repeatable, passed to ssh as `-o OPT`) and
+  `--remote-xes PATH` (default `xes`).
+- **Connection multiplexing** (`ControlMaster=auto`): when `--ssh` rides an
+  existing master connection, the `-R` forward can outlive the `xes` ssh
+  client and persist until the master closes. This is harmless in practice:
+  the receiver unlinks the remote socket path immediately after connecting,
+  so the stale forward is unreachable by name, the local server accepts
+  exactly one connection, and the random path (128 bits) is unguessable
+  beforehand.
+- The socket payload ends with an explicit end-of-payload marker (an extra
+  NUL) so the receiver detects truncation even on a record boundary.
+  `--remote-xes PATH` is passed to the remote shell **literally** — no `~`
+  or variable expansion happens locally, so use an absolute path when the
+  binary is not on the remote default `PATH`. When no command is given, the
+  receiver runs the remote login shell as `"$SHELL" -l`.
+- The evaluated variable names are checked against the local name policy
+  **before** ssh is spawned, and `--accept` / `--allow-unsafe-names` are
+  forwarded to the receiver so both sides enforce the same set.
+
+**Threat model.** The design protects secret values from: process argument
+lists (`ps`, `/proc/<pid>/cmdline`), shell history, logs, and persistent
+files on both ends (the socket files exist only for the duration of the
+session and carry no secrets in their names). It does **not** protect
+against the remote root user or the same user on the remote host: they can
+read the target process's environment (`/proc/<pid>/environ`) at any time.
+Treat the remote host as trusted for the secrets you send. The **CMD words
+after `--` are visible in `ps` on both hosts** — never put a secret in the
+command arguments themselves.
+
+**Fail-closed semantics.** The receiver never runs the command on partial
+input: an empty payload, a truncated final record, duplicate keys, invalid
+UTF-8, oversized input (`--max-input`, default 1 MiB), or refused variable
+names all abort before `exec`. `--accept GLOB` (repeatable) narrows the
+accepted names — a name matching no glob is an error — and never lifts the
+unsafe-name denylist; only `--allow-unsafe-names` does.
+
+### 7. In-Place File Editing (`-i` / `--in-place`)
 
 Safely modifies files in place using atomic write + rename semantics:
 
@@ -226,8 +324,12 @@ XDATA_USERNAME=${MSSQL_USERNAME
 |:---:|---|
 | `0` | Success |
 | `1` | Expansion error (`:?` assertion failure, `-u` / `--nounset` unset variable, `--strict` violation) |
-| `2` | Usage or CLI configuration error |
+| `2` | Usage or CLI configuration error; receiver-mode rejection (malformed/truncated/duplicate record, refused or non-accepted variable name, empty payload without `--allow-empty`, oversized input) |
 | `3` | I/O error (file not found, permission denied, etc.) |
+| `126` | `--exec`: command found but cannot be invoked |
+| `127` | `--exec`: command not found |
+
+With `--ssh`, the ssh exit status is propagated.
 
 ---
 

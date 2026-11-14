@@ -32,6 +32,7 @@ pub mod error;
 pub mod eval;
 pub mod glob;
 pub mod lexer;
+pub mod nullrec;
 pub mod parser;
 pub mod span;
 
