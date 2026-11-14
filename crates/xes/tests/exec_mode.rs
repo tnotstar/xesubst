@@ -166,7 +166,9 @@ fn deny_by_default_accept_restrictive_escape_hatch() {
             "--allow-unsafe-names",
             "--exec",
             "--",
-            "/bin/true",
+            // /bin/true does not exist on macOS; /usr/bin/true does on
+            // every supported platform.
+            "/usr/bin/true",
         ],
         &null_records(&[("LD_PRELOAD", "")]),
     );
@@ -321,7 +323,9 @@ fn exec_exit_codes_126_and_127() {
         &good,
     );
     assert_eq!(code, 127);
-    let (code, _, _) = run_xes(&["--from-null", "--exec", "--", "/etc/hostname"], &good);
+    // /etc/hosts exists and is not executable on Linux and macOS alike
+    // (/etc/hostname is Linux-only), so execve fails with EACCES -> 126.
+    let (code, _, _) = run_xes(&["--from-null", "--exec", "--", "/etc/hosts"], &good);
     assert_eq!(code, 126);
 }
 
