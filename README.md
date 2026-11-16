@@ -7,9 +7,9 @@ It faithfully replicates GNU `envsubst`'s command-line interface and default sub
 2. **Bash Arithmetic Expansion** (`$(( ... ))`) behind `--arith`.
 3. **Sequential `.env` Evaluation** (`--dotenv` / `-d`), allowing variables defined earlier in a file to be referenced by later lines without ever executing arbitrary code.
 
-The workspace is cleanly divided into:
-- **`xesubst`** (`crates/xesubst`): The core library providing parsing, AST, evaluation, globbing, and `.env` handling.
-- **`xes`** (`crates/xes`): The command-line binary.
+The single crate is cleanly divided into:
+- **`xesubst`** (library target, `src/lib.rs`): The core engine providing parsing, AST, evaluation, globbing, and `.env` handling.
+- **`xes`** (binary target, `src/main.rs`): The command-line interface.
 
 ---
 
@@ -26,7 +26,7 @@ cd xesubst
 cargo build --release
 
 # Install binary locally
-cargo install --path crates/xes
+cargo install --path .
 ```
 
 The compiled binary will be placed at `target/release/xes`.
@@ -359,9 +359,9 @@ The following shell constructs are deliberately **unsupported**:
 
 ## Architecture
 
-The project is structured as a clean Cargo workspace:
+The project is structured as a single root crate:
 
-- **`crates/xesubst`**: Core library crate containing:
+- **Library target `xesubst`** (`src/lib.rs` and modules under `src/`) containing:
   - `lexer.rs` & `parser.rs`: Streaming recursive-descent parser producing AST nodes with source spans.
   - `ast.rs`: Typed representation of expansions, operators, and word parts.
   - `glob.rs`: Self-contained Bash glob pattern engine supporting wildcards (`*`, `?`), ranges, character classes, and POSIX classes with shortest and longest match semantics.
@@ -370,7 +370,7 @@ The project is structured as a clean Cargo workspace:
   - `eval.rs`: Evaluator over `VariableTable`.
   - `dotenv.rs`: Sequential `.env` evaluator and multi-format serializer.
   - `span.rs` & `error.rs`: Source location tracking, diagnostic rendering, and exit code mapping.
-- **`crates/xes`**: A thin CLI wrapper binary crate using `clap` (derive), managing streams, file I/O, and atomic writes.
+- **Binary target `xes`** (`src/main.rs`, `src/ssh.rs`): A thin CLI wrapper using `clap` (derive), managing streams, file I/O, and atomic writes.
 
 ---
 
